@@ -1,0 +1,709 @@
+import numpy as np
+import random
+import math
+from numba import njit, prange
+from numba.typed import List
+from sklearn.preprocessing import normalize
+from scipy.special import factorial
+from functools import partial
+import gc
+import os
+import timeit
+
+LOOKUP_TABLE = np.array([
+    1, 1, 2, 6, 24, 120, 720, 5040, 40320,
+    362880, 3628800, 39916800, 479001600,
+    6227020800, 87178291200, 1307674368000,
+    20922789888000, 355687428096000, 6402373705728000,
+    121645100408832000, 2432902008176640000], dtype='int64')
+
+@njit
+def fast_factorial(n):
+    if n > 20:
+        raise ValueError
+    return LOOKUP_TABLE[n]
+
+def in_box(x,box,b):
+    return ((box[0]-1/2*b) < x[0] < (box[0]+1/2*b)) and ((box[1]-1/2*b)< x[1] < (box[1]+1/2*b))
+
+def propose_mix(vertex,box,b,alpha = 0.7): # oops q(x,y) not q(y,x) check/fix.
+    sigma = alpha*b
+    not_done = True
+    while not_done:
+        x = vertex + sigma*np.random.multivariate_normal((0,0), np.eye(2))
+        not_done = not in_box(x,box,b)
+    return np.array(x)
+# @njit(parallel=True)
+def Affinity(S,sigma):
+    m, n = S.shape
+    Affinity = np.zeros((m,m))
+    for i in prange(m):
+        for j in prange(m):
+            Affinity[i,j] = np.exp(-(1 / (2 * sigma**2)) * np.linalg.norm(S[i,:] - S[j,:])**2)
+    return Affinity
+
+def K_eigen(matrix,k):
+    # Calculate the eigenvalues and eigenvectors of the covariance matrix
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+
+    # Sort eigenvalues and their eigenvectors in descending order
+    sorted_indices = np.argsort(eigenvalues)[::-1]
+    sorted_eigenvalues = eigenvalues[sorted_indices]
+    sorted_eigenvectors = eigenvectors[:,sorted_indices]
+
+    # Select the first k eigenvectors
+    first_k_eigenvectors = sorted_eigenvectors[:,:k]
+
+    return first_k_eigenvectors
+
+def Norm(matrix):
+    row_sums=matrix.sum(axis=1)
+    new_matrix=np.zeros_like(matrix)
+    for i in range(matrix.shape[0]):
+        new_matrix[i,:] = matrix[i,:] / row_sums[i]
+    return new_matrix
+def Spectral_Embedding(S,A,k,sigma):
+    """
+    where S is the raw data, A is the adjacency matrix, and k is the dimension of the embedding, we use fully connected graph for the affinity/similarity graphs(s(x_i,x_j)=exp(-||x_i-x_j||^2/(2*sigma^2)))
+    """
+    Weighted = Affinity(S,sigma)
+    degrees = np.array(Weighted.sum(axis=1)).flatten()
+    D = np.diag(degrees)
+    
+    L = D - Weighted
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D)))
+    L_sym=np.matmul(np.matmul(D_inv_sqrt, L), D_inv_sqrt)
+    eigvals, eigvecs = np.linalg.eigh(L_sym)
+    sorted_indices = np.argsort(eigvals)
+    
+   
+    Embed=eigvecs[:, sorted_indices[1:k+1]]
+    return Embed
+# assign vetex v to the box, b is the sidelength of the box
+def Assign(v, b):
+    box = np.floor(v / b)
+    transfer_vector = [np.array([1, -1]), np.array([1, 1]), np.array([-1, -1]), np.array([-1, 1])]
+    chose_vector = [np.array([-1/3,-1/3]),np.array([-2/3,2/3])]
+    if (box[0] == v[0] / b) and (box[1] == v[1] / b):
+        chosen_item=random.choice(chose_vector)
+        return box * b+0.5*b*chosen_item
+    center_box = box * b + 0.5 * b*np.array([1, 1])
+    boxes = []
+    dist = []
+    for i in range(1, 3):
+        for j in transfer_vector:
+            new_box = center_box + (i / 3)* b*j
+            boxes.append(new_box)
+            dist.append(np.linalg.norm(v - new_box)**2)
+    boxes.append(center_box)
+    dist.append(np.linalg.norm(v - center_box)**2)
+    indice = np.argmin(np.array(dist))
+    return boxes[indice].copy()
+#create index set for the multinomial coefficient
+@njit
+def multi_index(w):
+    index_1=[]
+    index_2=[]
+    for s in range(w+1):  
+        for a in range(s+1):
+            for b in range(s+1):
+                for c in range(s+1):
+                    for d in range(s+1):
+                        for e in range(s+1):
+                            if a+b+c+d+e>s:
+                                continue
+                            else:
+                                index_1.append((s,a,b,c,d,e))
+                                index_2.append((2*b+c,2*(s-a-b-c-d-e)+e))
+    return index_1,index_2
+@njit
+def index_tri(w):
+    index_1=[]
+    # index_2=[]
+    for s in range(w+1):
+        for a in range(s+1):
+            for b in range(s+1):
+                if a+b>s:
+                    continue
+                else:
+                    index_1.append((s,a,b))
+    return index_1
+#find the points that in same box a[i] or all the points in box b
+def position(i,a,b=None):
+    if b is None:
+        positions = (a == a[i])
+        positions = np.nonzero(positions)[0]
+        positions = positions[positions != i]
+    else:
+        positions=(a==b[i])
+        positions = np.nonzero(positions)[0]
+        
+    return positions
+
+
+#calculate log-likelihood between boxes
+@njit(parallel=True)
+def L_BB_cal(m,k,L_BB,G_1,D_1):
+    for i in prange(m - 1):
+        for j in range(i + 1, m):
+            for y in prange(2):
+                for s in prange(k + 1):
+                    L_BB[i, j] += (1 / np.array(fast_factorial(s))) * G_1[y, s, i, j] * D_1[y, s, i, j]
+    return L_BB
+#calculate log-likelihood inside boxes
+@njit(parallel=True)
+def L_B_cal(Points_in_box,k,L_B,G_2,D_2):
+    for i in Points_in_box:
+        for y in prange(2):
+            for s in prange(k + 1):
+                L_B[i] += (1 / np.array(fast_factorial(s))) * G_2[y, s, i] * D_2[y, s, i]
+    return L_B
+
+#calculate diff and D_center
+@njit(parallel=True)
+def cal_distance(m,r,B_short,D_center,diff,V,B):
+    for i in prange(r):
+        diff[1,i]=np.linalg.norm(V[i,:] - B[i]) ** 2   
+    for i in prange(m):
+        for j in prange(m):
+            D_center[1, i, j] = np.linalg.norm(B_short[i] - B_short[j]) ** 2
+    return diff,D_center
+#power the matrix
+@njit(parallel=True)
+def power(matrix):
+    if matrix.ndim==3:
+        x=matrix.shape[0]
+        y=matrix.shape[1]
+        z=matrix.shape[2]
+        for i in prange(x):
+            for j in prange(y):
+                for s in prange(z):
+                    matrix[i,j,s] = matrix[1,j,s] ** i
+    else:
+        x=matrix.shape[0]
+        y=matrix.shape[1]
+        for i in prange(x):
+            for j in prange(y):
+                matrix[i,j]=matrix[1,j]**i
+    return matrix
+#calculate D_2
+@njit(parallel=True)
+def D_2_cal(k,V,A,D_2,B):
+    r=V.shape[0]
+    for y in prange(2):
+        for i in prange(r):
+            #find all the points in the same box of i
+            j_positions = (A == A[i])
+            j_positions = np.nonzero(j_positions)[0]
+            j_positions = j_positions[j_positions != i]
+            for j in j_positions:
+                if e[i,j]==y:
+                    for s in prange(k+1):
+                        D_2[y,s,i]+= (np.linalg.norm(V[i,:]-V[j,:])**2-np.linalg.norm(V[i,:]-B[i,:])**2)**s
+    return D_2
+#calculate M_2
+@njit(parallel=True)
+def M_2_cal(index_1,V,A,M_2,Points_in_box,B):
+    for y in prange(2):
+        for i in Points_in_box:
+            for s, a_1, a_2 in index_1:
+                #find all the points in the same box of i
+                positions = (A == A[i])
+                positions = np.nonzero(positions)[0]
+                j_positions=positions
+                j_positions = j_positions[j_positions != i]
+                for j in j_positions:
+                    if e[i,j]==y:
+                        M_2[y, s, a_1, a_2, i] += ((V[j, 0] ** 2 + V[j, 1] ** 2 - B[j, 0] ** 2 - B[j, 1] ** 2)) ** a_1 * ((B[j, 0] - V[j, 0]) ** a_2) * (B[j, 1] - V[j, 1]) ** (s - a_1 - a_2)
+    return M_2
+@njit(parallel=True)
+def M_1_cal(index_3,V,m,A_short,A,M_1,e,r):
+    for i in prange(r):
+        for f in prange(m):
+            #box f can not be the same one for i
+            if f==A[i]:
+                continue
+            else:
+                #find all the elements in box f
+                j_positions = (A == A_short[f])
+                j_positions = np.nonzero(j_positions)[0]
+                for j in j_positions:
+                    for y in prange(2):
+                        if e[i,j]==y:
+                            for w,w_1 in index_3:
+                                M_1[y,w,w_1,i,f]+=V[j,0]**w*V[j,1]**w_1
+              
+                            
+    return M_1
+
+@njit(parallel=True)
+def D_1_cal(V,B,D_1,A,A_short,k,e):
+    r=A.shape[0]
+    for i in prange(r-1):
+        for j in range(i+1,r):
+            # find box of point i
+            select_box_i=(A_short==A[i])
+            select_box_i=np.nonzero(select_box_i)[0]
+            # find box of point j
+            select_box_j=(A_short==A[j])
+            select_box_j=np.nonzero(select_box_j)[0]
+            # if two boxes are different, add the value to the moments
+            if select_box_i==select_box_j:
+                continue
+            elif select_box_i<select_box_j:
+                if e[i,j]==1:
+                    for s in prange(k+1):
+                        D_1[1,s,select_box_i[0],select_box_j[0]]+=(np.linalg.norm(V[i,:]-V[j,:])**2-np.linalg.norm(B[i,:]-B[j,:])**2)**s
+                else:
+                    for s in prange(k+1):
+                        D_1[0,s,select_box_i[0],select_box_j[0]]+=(np.linalg.norm(V[i,:]-V[j,:])**2-np.linalg.norm(B[i,:]-B[j,:])**2)**s
+            else:
+                if e[i,j]==1:
+                    for s in prange(k+1):
+                        D_1[1,s,select_box_j[0],select_box_i[0]]+=(np.linalg.norm(V[i,:]-V[j,:])**2-np.linalg.norm(B[i,:]-B[j,:])**2)**s
+                else:
+                    for s in prange(k+1):
+                        D_1[0,s,select_box_j[0],select_box_i[0]]+=(np.linalg.norm(V[i,:]-V[j,:])**2-np.linalg.norm(B[i,:]-B[j,:])**2)**s
+    return D_1
+@njit
+def multi_coeff(w,a,b,c,d,e,f):
+    if w>20:
+        raise ValueError
+    result=fast_factorial(w)/(fast_factorial(a)*fast_factorial(b)*fast_factorial(c)*fast_factorial(d)*fast_factorial(e)*fast_factorial(f))
+    return result
+@njit
+def binom_coeff(w,a):
+    if w>20:
+        raise ValueError
+    result=fast_factorial(w)/(fast_factorial(a)*fast_factorial(w-a))
+    return result
+#calculate the triangle_5
+@njit
+def triangle_cal5(proposed_v,V,B,s,a,b,i):
+    result=vh_cal(proposed_v,B[i,:],s,a,b)-vh_cal(V[i,:],B[i,:],s,a,b)
+    return result
+@njit
+def vh_cal(V,B,s,a,b):
+    result=(V[0]**2 + V[1]**2 - B[0]**2 - B[1]**2)**a * (2 * (B[0] - V[0]))**b * (2 * (B[1] - V[1]))**(s - a - b)
+    return result
+#function update moments M_1
+@njit
+def up_M_1(index_3,Up_M_f,proposed_v,V,i,A):
+    for u_1,u_2 in index_3:
+        Up_M_f[u_1,u_2,A[i]]+=proposed_v[0]**u_1*proposed_v[1]**u_2-V[i,0]**u_1*V[i,1]**u_2
+    return Up_M_f
+#function update moments M_2
+@njit
+def up_M_2(index_1,Up_M_s,proposed_v,V,i,B,A):
+    i_box=A[i]
+    for s,a,b in index_1:
+        Up_M_s[s,a,b,i_box]+=vh_cal(proposed_v,B[i,:],s,a,b)-vh_cal(V[i,:],B[i,:],s,a,b)
+    return Up_M_s
+# the propose function will return a value x with shape [2,]
+@njit
+def triangle_1(i,a_1,a_2,x,y):
+    return np.array(x[0]**a_1*x[1]**a_2-y[i,0]**a_1*y[i,1]**a_2)
+
+# function update diff
+@njit(parallel=True)
+def up_diff(diff,B,proposed_v,i,k):
+    diff[1,i]=np.linalg.norm(proposed_v-B[i,:])**2
+    for s in prange(k+1):
+        diff[s,i]=diff[1,i]**s
+    return diff
+    
+
+# generate a binary and symmetric matrix
+def generate(n):
+    # Step 1: Create an n x n matrix filled with zeros
+    matrix = np.zeros((n, n), dtype=int)
+    
+    # Step 2: Fill the upper triangle (excluding the diagonal) with random 0s and 1s
+    upper_triangle_indices = np.triu_indices(n, k=1)
+    matrix[upper_triangle_indices] = np.random.randint(2, size=len(upper_triangle_indices[0]))
+    
+    # Step 3: Mirror the upper triangle to the lower triangle to ensure symmetry
+    matrix = matrix + matrix.T
+    
+    # Step 4: Ensure the diagonal elements are set to 0
+    np.fill_diagonal(matrix, 0)
+    
+    return matrix
+    
+
+#calculate the log-likelihood \prod_{1\leq i<j\leq N}f(d(v_i,v_j);theta)
+@njit(parallel=True)
+def actual_likelihood(V, e, theta,D,fctn):
+    r=V.shape[0]
+    log_like=np.zeros((r,r))
+    for i in prange(r-1):
+        for j in range(i+1,r):
+           
+            D[i,j]=np.linalg.norm(V[i,:]-V[j,:])**2
+            if e[i,j]==1:
+                log_like[i,j]=fctn(D[i,j],e=1,theta=theta)
+            else:
+                log_like[i,j]=fctn(D[i,j],e=0,theta=theta)
+    return log_like,D
+#update the log-likelihood \prod_{1\leq i<j\leq N}f(d(v_i,v_j);theta) when update one vertex v_i
+@njit(parallel=True)
+def up_likelihood1(proposed_v, e, theta, i, log_up, D,  fctn):
+    r = D.shape[0]
+    for j in prange(r):
+        # dist = np.linalg.norm(V_new[j, :] - V_new[i, :])**2
+        if j == i:
+            continue
+        # Compute the distance between points once
+            # Assign distances symmetrically
+        elif j < i:
+            D[j, i] =np.linalg.norm(V[j, :] - proposed_v)**2
+            if e[j, i] == 1:
+                log_up[j, i] = fctn(D[j, i],e=1,theta=theta)
+            else:
+                log_up[j, i] = fctn(D[j, i], e=0,theta=theta)
+        else:
+            D[i, j] = np.linalg.norm(V[j, :] -proposed_v)**2
+            if e[i, j] == 1:
+                log_up[i, j] = fctn( D[i, j], e=1,theta=theta)
+            else:
+                log_up[i, j] = fctn( D[i, j],e=0,theta=theta)
+    return log_up, D
+
+#link function
+@njit
+def g_np_c(D, e, theta):
+    if e == 1:
+        p = -np.log( 1 + np.exp(3*D-theta))
+    else:
+        p = -np.log(1 + np.exp(  theta-3*D))
+    return p
+
+
+#update moments M_1, M_2, D_1,D_2,L_BB
+@njit(parallel=True)
+def update_moments(i,A,M_1_new,D_1_new,G_1,L_BB_new,m,Up_M_f,M_2_new,D_2_new,Up_M_s,Points_in_box,proposed_v,V_new,index_1,index_3):
+    i_box=A[i]
+    for j_box in prange(m):
+        if j_box==A[i]:
+            continue
+        else:
+            #update M_1
+            for y in prange(2):
+                for w_1,w_2 in index_3:
+                    M_1_new[y,w_1,w_2,i,j_box]+=Up_M_f[w_1,w_2,j_box].item()
+            # update D_1
+            triangle_2=np.zeros(2)
+            for y in prange(2):
+                item_1=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,2,0,proposed_v,V_new)*M_1_new[y,0,0,i,j_box]
+                item_2=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,0,proposed_v,V_new)*M_1_new[y,2,0,i,j_box]
+                item_3=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,1,0,proposed_v,V_new)*M_1_new[y,1,0,i,j_box]
+                item_4=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,2,proposed_v,V_new)*M_1_new[y,0,0,i,j_box]
+                item_5=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,0,1,proposed_v,V_new)*M_1_new[y,0,1,i,j_box]
+                item_6=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,0,proposed_v,V_new)*M_1_new[y,0,2,i,j_box]
+                triangle_2[y]=item_1+item_2+item_3+item_4+item_5+item_6
+            if j_box<A[i]:      
+                D_1_new[y,1,j_box,i_box]+=triangle_2[y]
+            elif j_box>A[i]:
+                D_1_new[y,1,i_box,j_box]+=triangle_2[y]
+                
+    for f in prange(m):
+        if f==A[i]:
+            continue
+        elif f<A[i]:
+            triangle=np.zeros(2)
+            for y in prange(2):
+                for s in prange(2):
+                    triangle[y]+=np.array(1 / fast_factorial(s))*G_1[y,s,f,i_box].item()*D_1_new[y,s,f,i_box].item()
+                # +(1 / np.array(fast_factorial(1)))*G_1[y,1,f,i_box]*D_1_new[y,1,f,i_box]
+            L_BB_new[f,i_box]=np.sum(triangle)
+        else:
+            triangle=np.zeros(2)
+            for y in prange(2):
+                for s in prange(2):
+                    triangle[y]+=(1 / np.array(fast_factorial(s)))*G_1[y,s,i_box,f].item()*D_1_new[y,s,i_box,f].item()
+                # +(1 / np.array(fast_factorial(1)))*G_1[y,1,i_box,f]*(D_1_new[y,1,i_box,f])
+            L_BB_new[i_box,f]=np.sum(triangle)
+    if i in Points_in_box:
+        j_positions = (A == A[i])
+        j_positions = np.nonzero(j_positions)[0]
+        j_positions = j_positions[j_positions != i]
+        for y in prange(2):
+            for j in j_positions:
+                triangle_3=np.zeros(2)
+                for s,a,b in index_1:
+                    M_2_new[y,s,a,b,i]+=Up_M_s[s,a,b,i_box].item()
+                #update D_2_j
+                item_1=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,2,0,proposed_v,V_new)*V_new[j,0]**0*V_new[j,1]**0
+                item_2=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,0,proposed_v,V_new)*V_new[j,0]**2*V_new[j,1]**0
+                item_3=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,1,0,proposed_v,V_new)*V_new[j,0]**1*V_new[j,1]**0
+                item_4=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,2,proposed_v,V_new)*V_new[j,0]**0*V_new[j,1]**0
+                item_5=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,0,1,proposed_v,V_new)*V_new[j,0]**0*V_new[j,1]**1
+                item_6=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,0,proposed_v,V_new)*V_new[j,0]**0*V_new[j,1]**2
+                triangle_3[y]=item_1+item_2+item_3+item_4+item_5+item_6
+                D_2_new[y,1,j]+=triangle_3[y]
+            #update D_2_i
+            item_1=multi_coeff(1,1,0,0,0,0,0)*(-2)**(0)*triangle_1(i,0,0,proposed_v,V_new)*M_2_new[y,1,1,0,i]
+            item_2=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,1,0,proposed_v,V_new)*M_2_new[y,1,0,1,i]
+            item_3=multi_coeff(1,1,0,0,0,0,0)*(-2)**(1)*triangle_1(i,0,1,proposed_v,V_new)*M_2_new[y,1,0,0,i]
+            D_2_new[y,1,i]+=item_1+item_2+item_3
+    return M_1_new,D_1_new,L_BB_new,M_2_new,D_2_new,j_positions
+#update L_B
+@njit(parallel=True)
+def update_L_B(i,D_2_new,L_B_new,j_positions,G_2_new,diff_update_i,theta):
+    for s in prange(2):
+        G_2_new[0,s,i]=first_order_derivative(x=diff_update_i,theta=theta,e=0,derivative_order=s)
+        G_2_new[1,s,i]=first_order_derivative(x=diff_update_i,theta=theta,e=0,derivative_order=s)
+     # calculate L_B[i]
+    triangle=np.zeros(2)
+    for y in prange(2):
+        triangle[y]=(1 / np.array(fast_factorial(0)))*G_2_new[y,0,i].item()*D_2_new[y,0,i].item()+(1 / np.array(fast_factorial(1)))*G_2_new[y,1,i].item()*D_2_new[y,1,i].item()
+    L_B_new[i]=np.sum(triangle)
+    #calculate L_B[j]
+    for j in j_positions:
+        triangle=np.zeros(2)
+        for y in prange(2):
+            triangle[y]=(1 / np.array(fast_factorial(0)))*G_2_new[y,0,j].item()*D_2_new[y,0,j].item()+(1 / np.array(fast_factorial(1)))*G_2_new[y,1,j].item()*D_2_new[y,1,j].item()
+        L_B_new[j]=np.sum(triangle)
+    return L_B_new,G_2_new
+
+@njit(parallel=True)
+def sum_log_likelihood(L_BB,L_B):
+    L=0
+    for i in prange(L_BB.shape[0]):
+        for j in prange(L_BB.shape[0]):
+            L+=L_BB[i,j]
+    for f in prange(L_B.shape[0]):
+        L+=0.5*L_B[f]
+    return L
+def preprocessing(V, e, k, b, theta): 
+    """V is the latent positions, e is the edge matrix, k is the order of the Taylor expansion, b is the sidelength of box, theta is the parameter of link function
+    B is the results of assigning vertices. B_short is non-empty box list, 
+    diff is the distance between vertex to the center of its box, D_center is the distance between different boxes
+    G_1 is the derivative of d(centre[i],centre[j]), G_2 is the derivative of d(V[i],centre[V[i]]) (only when there are more than 1 points in the box)
+    M_1,M_2 is the moments of between boxes and inside box, D_1,D_2 is the moments of distance between boxes and inside box,
+    L_BB is the log-likelihood between boxes, L_B is the log-likelihood inside large box(contains more than one point)
+    """
+    r = V.shape[0]
+    B = []
+    diff = np.zeros((k + 1, r))
+    index_1=index_tri(k)
+    index_2,index=multi_index(k)
+    index=np.array(index)
+    index_3=np.unique(index,axis=0)
+    #Assign points to the boxes
+    for i in range(r):
+        B.append(Assign(V[i, :], b))
+
+    B = np.stack(B)
+    #select non-empty boxes,save the locations of the centre
+    B_short = np.unique(B, axis=0)
+    #get new index to the box
+    A = []
+    for i in range(B.shape[0]):
+        positions = (B_short[:, 0] == B[i, 0]) & (B_short[:, 1] == B[i, 1])
+        positions = np.nonzero(positions)[0]
+        A.append(positions if len(positions) > 0 else np.array([-1], dtype=np.longlong))
+
+    A = np.stack(A)
+    A_short,counts = np.unique(A,axis=0,return_counts=True)
+    # select boxes contain more than one point 
+    large_box=A_short[counts>1]
+    selected_positions=[]
+    for i in range(large_box.shape[0]):
+        select_position=[]
+        select_position=position(i,A,large_box)
+        selected_positions.append(select_position)
+    if selected_positions:
+        Points_in_box = np.concatenate(selected_positions)
+    else:
+        Points_in_box = np.array([])
+
+    m = A_short.shape[0]
+        
+        
+    M_1 = np.zeros((2, 2*k + 1, 2*k + 1, r, m))
+    M_2 = np.zeros((2, k + 1, k + 1, k + 1, r))
+    D_1 = np.zeros((2, k + 1, m, m))
+    D_2 = np.zeros((2, k + 1, r))
+    G_1 = np.zeros((2, k + 1, m, m))
+    G_2 = np.zeros((2, k + 1, r))
+    L_BB = np.zeros((m, m))
+    L_B = np.zeros(r)
+    D_center = np.zeros((k + 1, m, m))
+    diff,D_center=cal_distance(m,r,B_short,D_center,diff,V,B)
+    for i in Points_in_box:
+        for s in range(k + 1):
+            G_2[0, s, i] = first_order_derivative(x=diff[1,i],theta=theta,e=0,derivative_order=s)
+            G_2[1, s, i] = first_order_derivative(x=diff[1,i],theta=theta,e=1,derivative_order=s)
+    for i in range(m - 1):
+        for j in range(i + 1, m):
+            for s in range(k + 1):
+                G_1[0, s, i, j] = first_order_derivative(x=D_center[1][i, j],theta=theta,e=0,derivative_order=s)
+                G_1[1, s, i, j] = first_order_derivative(x=D_center[1][i, j],theta=theta,e=1,derivative_order=s)
+    D_center=power(D_center)
+    diff=power(diff)
+    M_1=M_1_cal(index_3,V,m,A_short,A,M_1,e,r)
+    if Points_in_box.size>0:
+        M_2=M_2_cal(index_1,V,A,M_2,Points_in_box,B)
+        D_2=D_2_cal(k,V,A,D_2,B)
+        L_B=L_B_cal(Points_in_box,k,L_B,G_2,D_2)         
+    D_1=D_1_cal(V,B,D_1,A,A_short,k,e)
+                                                   
+    L_BB=L_BB_cal(m,k,L_BB,G_1,D_1)
+
+
+    # L = np.sum(L_BB) + 0.5 * np.sum(L_B)
+    L = sum_log_likelihood(L_BB,L_B)
+    
+    return L_BB, L_B, L, M_1, M_2, D_1, D_2, G_1, G_2, D_center, diff, A, A_short, np.array(index_1), np.array(index_2), index_3, B, B_short,Points_in_box
+
+
+# true MH
+def metropolis_hasting(V, e, theta,T,fctn):
+    r=V.shape[0]
+    D=np.zeros((r,r))
+    log_like=np.zeros((r,r))
+    Log_like,D=actual_likelihood(V, e, theta,D,fctn)
+    L=np.sum(log_like)
+    for t in range(T):
+        for i in range(r):
+            V_new=V.copy()
+            proposed_v=np.random.multivariate_normal(V_new[i,:], np.eye(2))
+            V_new[i]= proposed_v
+            log_up=log_like.copy()
+            log_up,D=up_likelihood1(proposed_v, e, theta, i, log_up, D, fctn)
+            L_new=np.sum(log_up)
+            #compute the ratio
+            alpha_1=np.minimum(0,L_new-L)
+            if np.log(np.random.rand())<alpha_1:
+                V=V_new
+                L,log_like=L_new,log_up
+    return V
+
+
+def Grid_approach_MCMC(V, k, b,theta, L_BB, L_B, L, M_1, M_2, D_1, D_2, G_1, G_2, diff, A, A_short, index_1, index_3, B, Points_in_box, T):
+    r = V.shape[0]
+    m = A_short.shape[0]
+    # to draw the trace plot, we save several chains
+    chain_1=[]
+    chain_2=[]
+    p,q=np.random.randint(0,r,2)
+
+    for t in range(T):
+        # at start of each t, we set the update function to be zero matrix
+        Up_M_f = np.zeros((2 * k + 1, 2 * k + 1, m))
+        Up_M_s = np.zeros((k+1, k+1, k+1, m))
+        if (t/T)%0.25==0:
+            print("has run ",25*(4*t/T),"percent")
+        for i in range(r):
+            i = int(i)  # Ensure `i` is an integer
+            V_new = V.copy()
+            proposed_v = propose_mix(V_new[i, :], B[i], b)
+            diff_update_i = np.linalg.norm(proposed_v - B[i])**2
+            M_1_new = M_1.copy()
+            M_2_new = M_2.copy()
+            D_1_new = D_1.copy()
+            D_2_new = D_2.copy()
+            L_BB_new = L_BB.copy()
+            L_B_new = L_B.copy()
+            G_2_new = G_2.copy()
+            #j_positions: all the vertices in the same box of vertex i
+            
+            M_1_new, D_1_new, L_BB_new, M_2_new, D_2_new,j_positions = update_moments(
+                i, A, M_1_new, D_1_new, G_1, L_BB_new, m, Up_M_f, M_2_new, D_2_new, Up_M_s, Points_in_box, proposed_v, V_new, index_1, index_3
+            )
+            
+            if i in Points_in_box:
+                L_B_new, G_2_new = update_L_B(i,D_2_new,L_B_new,j_positions,G_2_new,diff_update_i,theta)
+            
+            L_new = sum_log_likelihood(L_BB_new,L_B_new)
+            alpha_1 = np.minimum(0, L_new - L)
+
+            if np.log(np.random.rand()) < alpha_1:
+                V_new[i, :] = proposed_v
+                V = V_new
+                Up_M_f = up_M_1(index_3, Up_M_f, proposed_v, V_new, i, A)
+                Up_M_s = up_M_2(index_1, Up_M_s, proposed_v, V_new, i, B, A)
+                diff = up_diff(diff, B, proposed_v, i, k)
+                L_BB, L_B, L, M_1, M_2, D_1, D_2, G_2 = L_BB_new, L_B_new, L_new, M_1_new, M_2_new, D_1_new, D_2_new, G_2_new
+        chain_1.append(V[p,:])
+        chain_2.append(V[q,:])
+    
+    chain = np.concatenate([chain_1, chain_2])
+    return V,chain
+# n is number of nodes
+n=200
+# e is edge matrix
+e=generate(n)
+# generate raw data
+data = np.random.rand(n, 2)
+# define the dimension of the embedding
+d=2
+sigma = 0.5
+embedding=Spectral_Embedding(data,e,d,sigma)
+# scale the space
+sum_0=np.linalg.norm(data,axis=1)
+sum_1=np.linalg.norm(embedding, axis=1)
+c=np.sum(sum_0)/np.sum(sum_1)
+# the latent positions
+V=c*embedding
+# set up parameters k=1, theta=0.5, b=1/(n**(2/(k+1)))*c
+k = 1
+theta = 0.5
+b=1/(n**(2/(k+1)))
+b=b*c
+# calculate derivative, if derivative_order=0, return the value of link function
+@njit
+def first_order_derivative(x, theta, e, derivative_order):
+    if derivative_order==0:
+        if e == 1:
+            p = -np.log( 1 + np.exp(3*x-theta))
+        else:
+            p = -np.log(1 + np.exp(theta-3*x))
+    else:
+        if e==1:
+            p=-3/(np.exp(theta-3*x) + 1)
+        else:
+            p=3/(np.exp(3*x-theta) + 1)
+    return p
+
+
+
+L_BB, L_B, L, M_1, M_2, D_1, D_2, G_1, G_2, D_center, diff, A, A_short, index_1, index_2, index_3, B, B_short, Points_in_box = preprocessing( V=V, e=e, k=k, b=b, theta=theta)
+print("finished preprocessing")
+r=V.shape[0]
+m=A_short.shape[0]
+D=np.zeros((r,r))
+Log_like,D=actual_likelihood(V, e, theta,D,g_np_c)
+L_real=np.sum(Log_like)
+#initial error for the approximations
+print("initial approximate error of log-likelihood is",np.abs(L-L_real))
+# true MH
+def metropolis_hasting(V, e, theta,T,fctn):
+    r=V.shape[0]
+    D=np.zeros((r,r))
+    log_like=np.zeros((r,r))
+    Log_like,D=actual_likelihood(V, e, theta,D,fctn)
+    L=np.sum(log_like)
+    for t in range(T):
+        for i in range(r):
+            V_new=V.copy()
+            proposed_v=np.random.multivariate_normal(V_new[i,:], np.eye(2))
+            V_new[i]= proposed_v
+            log_up=log_like.copy()
+            log_up,D=up_likelihood1(proposed_v, e, theta, i, log_up, D, fctn)
+            L_new=np.sum(log_up)
+            #compute the ratio
+            alpha_1=np.minimum(0,L_new-L)
+            if np.log(np.random.rand())<alpha_1:
+                V=V_new
+                L,log_like=L_new,log_up
+    return V
+print("start Grid_approach_MCMC")
+V_GAM,chains=Grid_approach_MCMC(V,k,b,theta,L_BB, L_B, L, M_1, M_2, D_1, D_2, G_1, G_2, diff, A, A_short, index_1, index_3, B, Points_in_box, T=500)
+
+print("finished Grid_approach_MCMC")
+from memory_profiler import memory_usage
+mem_usage = memory_usage()
+print(f"Memory usage after execution: {mem_usage}")
+
